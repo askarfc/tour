@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+HT.kz Tour Watcher - Baan Karon Buri Resort (Ocean View)
+"""
+
+import html
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+SEEN_FILE = Path(os.environ.get("SEEN_TOURS_FILE", "seen_tours.json"))
+
+TARGET_HOTEL_KEYWORDS = ["baan karon buri", "bann karon buri", "karon buri"]
+TARGET_ROOM_KEYWORDS = ["ocean view", "sea view", "вид на море", "океан"]
+
+CITY_FROM = "astana"
+COUNTRY_TO = "thailand"
+REGION_TO = "phuket"
+ADULTS = 1
+
+DATE_FROM = os.environ.get("DATE_FROM", "2026-11-18")
+DATE_TO = os.environ.get("DATE_TO", "2026-11-30")
+NIGHTS_MIN = int(os.environ.get("NIGHTS_MIN", "7"))
+NIGHTS_MAX = int(os.environ.get("NIGHTS_MAX", "11"))
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://ht.kz/",
+    "Origin": "https://ht.kz",
+}
+
+
+def search_ht_tours() -> list[dict]:
+    url = "https://api.ht.kz/v1/search/tours"
+    payload = {
+        "depart_city": CITY_FROM,
+        "country": COUNTRY_TO,
+        "region": REGION_TO,
+        "date_from": DATE_FROM,
+        "date_to": DATE_TO,
+        "nights_from": NIGHTS_MIN,
+        "nights_to": NIGHTS_MAX,
+        "adults": ADULTS,
+        "currency": "KZT",
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("tours", []) or data.get("results", []) or []
+    except requests.RequestException as e:
+        print(f"[ERROR] Ошибка запроса к API ht.kz: {e}", file=sys.stderr)
+        return []
+
+
+def filter_target_tours(tours: list[dict]) -> list[dict]:
+    matched = []
+    for tour in tours:
+        hotel_name = str(tour.get("hotel_name") or tour.get("hotel", {}).get("name", "")).lower()
+        room_name = str(tour.get("room_name") or tour.get("room", {}).get("name", "")).lower()
+
+        if not any(kw in hotel_name for kw in TARGET_HOTEL_KEYWORDS):
+            continue
+
+        is_room_match = any(kw in room_name for kw in TARGET_ROOM_KEYWORDS)
+        
+        matched.append({
+            "id": str(tour.get("id") or f"{hotel_name}_{tour.get('price')}_{tour.get('date')}"),
+            "hotel": tour.get("hotel_name") or "Baan Karon Buri Resort",
+            "room": tour.get("room_name") or ("Ocean View" if is_room_match else "Стандарт / Уточняется"),
+            "price": int(tour.get("price") or tour.get("price_kzt") or 0),
+            "date": tour.get("depart_date") or tour.get("date_from"),
+            "nights": tour.get("nights"),
+            "meal": tour.get("meal_type") or tour.get("meal", "Завтраки"),
+            "url": tour.get("share_url") or "https://ht.kz/hotel/phuket-baan-karon-buri-resort",
+            "exact_room_match": is_room_match,
+        })
+
+    return matched
+
+
+def load_seen() -> dict:
+    if SEEN_FILE.exists():
+        try:
+            return json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def save_seen(seen: dict) -> None:
+    SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def send_telegram(message: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Переменные TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[ERROR] Ошибка отправки в Telegram: {e}", file=sys.stderr)
+
+
+def main():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Проверка туров...")
+    raw_tours = search_ht_tours()
+    matched_tours = filter_target_tours(raw_tours)
+
+    ocean_view_tours = [t for t in matched_tours if t["exact_room_match"]]
+    tours_to_process = ocean_view_tours if ocean_view_tours else matched_tours
+
+    if not tours_to_process:
+        print("[INFO] Туры по критериям не найдены.")
+        return
+
+    seen = load_seen()
+    updates = []
+
+    for tour in tours_to_process:
+        tour_key = f"{tour['date']}_{tour['nights']}_{tour['room']}"
+        old_price = seen.get(tour_key, {}).get("price")
+        current_price = tour["price"]
+
+        if old_price is None or current_price != old_price:
+            price_change = ""
+            if old_price is not None:
+                diff = current_price - old_price
+                price_change = f" (было {old_price:,} ₸, {'📈 +' if diff > 0 else '📉 '}{diff:,} ₸)"
+
+            updates.append((tour, price_change))
+            seen[tour_key] = {
+                "price": current_price,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    if updates:
+        for tour, price_change in updates:
+            room_icon = "🌊" if tour["exact_room_match"] else "🏨"
+            msg = (
+                f"🏝 <b>HT.kz — Тур в Таиланд (Пхукет)</b>\n\n"
+                f"🏨 <b>{html.escape(tour['hotel'])}</b>\n"
+                f"{room_icon} <b>Номер:</b> {html.escape(tour['room'])}\n"
+                f"📅 <b>Вылет:</b> {tour['date']} ({tour['nights']} ночей)\n"
+                f"🍽 <b>Питание:</b> {html.escape(str(tour['meal']))}\n"
+                f"👤 <b>Гости:</b> 1 взрослый\n\n"
+                f"💰 <b>Цена:</b> {tour['price']:,} ₸{price_change}\n\n"
+                f"🔗 <a href=\"{tour['url']}\">Открыть тур на HT.kz</a>"
+            )
+            send_telegram(msg)
+            time.sleep(1)
+
+        save_seen(seen)
+        print(f"[INFO] Отправлено алертов: {len(updates)}")
+    else:
+        print("[INFO] Изменений цен нет.")
+
+
+if __name__ == "__main__":
+    main()
